@@ -8,7 +8,24 @@
 #include <vector>
 #include <sys/stat.h>
 #include "fileManager.h"
+#include "ocr.hpp"
 #include <cstdio>
+#include <future>
+#include <fstream>
+#include <semaphore.h> // Para semáforos
+#include <chrono>
+#include <thread>
+const int MAX_CONCURRENT_THREADS = 4;
+sem_t semaphore;
+
+std::string performOCR(const std::string &imagePath)
+{
+    // std::cout << "Realizando OCR en: " << imagePath << std::endl;
+    // std::string text = "Texto OCR de " + imagePath; // Placeholder
+    // std::this_thread::sleep_for(std::chrono::seconds(1));
+    // return getTextByImage(imagePath);
+    return "test";
+}
 
 std::string format_milliseconds(int ms)
 {
@@ -38,8 +55,8 @@ void imgExtractor(const std::string &fileName)
     static double fps = video.get(cv::CAP_PROP_FPS);
     int total_frames = static_cast<int>(video.get(cv::CAP_PROP_FRAME_COUNT));
     std::cout << "FPS: " << fps << ", Total Frames: " << total_frames << std::endl;
-    static int fpsCut = 2;
-    static int auxTime = (1000 / 5) / 4;
+    static int fpsCut = static_cast<int>(2);
+    static int auxTime = 0;
 
     // Load ONNX model
     cv::dnn::Net net = cv::dnn::readNetFromONNX("models/model.onnx");
@@ -49,6 +66,7 @@ void imgExtractor(const std::string &fileName)
     cv::Mat temporalFrameGray, temporalFrameColor;
     bool contentText = false;
     bool temporalTextState = false;
+    std::vector<std::future<std::string>> ocr_futures;
     int counter = 1, temporalCounter = 1;
     while (counter <= total_frames)
     {
@@ -121,7 +139,18 @@ void imgExtractor(const std::string &fileName)
             {
 
                 // cout << "./" + folderName + "/" + format_milliseconds(temporalTime) + "__" + format_milliseconds(temporalTimeC) + ".jpeg" << endl;
-                cv::imwrite("./" + folderName + "/" + format_milliseconds(((temporalCounter++ / fps) * 1000) - auxTime) + "__" + format_milliseconds(((counter / fps) * 1000) + auxTime) + ".jpeg", temporalFrameColor);
+                std::string imagePath = "./" + folderName + "/" + format_milliseconds(((temporalCounter++ / fps) * 1000) - auxTime) + "__" + format_milliseconds(((counter / fps) * 1000) + auxTime) + ".jpeg";
+                cv::imwrite(imagePath, temporalFrameColor); // Espera a que haya un hilo disponible (semáforo)
+                sem_wait(&semaphore);
+
+                // Lanza el OCR de forma asíncrona
+                std::future<std::string> ocrFuture = std::async(std::launch::async, [imagePath]()
+                                                                {
+                 std::string result = performOCR(imagePath);
+                 sem_post(&semaphore); // Libera un hilo (semáforo)
+                 return result; });
+
+                ocr_futures.push_back(std::move(ocrFuture));
             }
 
             if (difference > 30000 && contentText)
@@ -139,12 +168,23 @@ void imgExtractor(const std::string &fileName)
     }
     video.release();
     cv::destroyAllWindows();
+    // Espera a que todas las tareas de OCR se completen y guarda los resultados
+    for (auto &future : ocr_futures)
+    {
+        std::string ocrText = future.get();
+        // std::string imagePath = future.get(); // NO FUNCIONA, el "future" ya se obtuvo.
+
+        // std::string txtPath = imagePath.substr(0, imagePath.size() - 4) + ".txt"; // Reemplaza la extensión .jpeg por .txt
+        // std::ofstream outfile(txtPath);
+        // outfile << ocrText << std::endl;
+        // outfile.close();
+
+        // std::cout << "Texto OCR: " << ocrText << " guardado en " << txtPath << std::endl;
+    }
 }
 int main()
 {
-    int status = system("curl -X POST -D '{}' -H 'Content-Type: application/json' http://149.130.167.77/api/v1/login ");
-    // std::cout << ifstream("test.txt").rdbuf();
-    std::cout << "Exit code: " << status << std::endl;
+    sem_init(&semaphore, 0, MAX_CONCURRENT_THREADS);
     if (existeDirectorio("videos") == false)
     {
         mkdir("videos");
@@ -154,6 +194,7 @@ int main()
         mkdir("subtitles");
     }
     list_files("videos", imgExtractor);
+    sem_destroy(&semaphore); // Destruye el semáforo
 
     return 0;
 }
