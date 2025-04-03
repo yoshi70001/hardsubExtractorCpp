@@ -8,14 +8,15 @@
 #include <vector>
 #include <sys/stat.h>
 #include "fileManager.h"
-#include "ocr.hpp"
+#include "utils/ocr.hpp"
 #include <cstdio>
 #include <future>
 #include <fstream>
 #include <semaphore.h> // Para semáforos
 #include <chrono>
 #include <thread>
-const int MAX_CONCURRENT_THREADS = 4;
+#include "utils/media.hpp"
+const int MAX_CONCURRENT_THREADS = 2;
 sem_t semaphore;
 
 std::string performOCR(const std::string &imagePath)
@@ -57,9 +58,12 @@ void imgExtractor(const std::string &fileName)
     std::cout << "FPS: " << fps << ", Total Frames: " << total_frames << std::endl;
     static int fpsCut = static_cast<int>(2);
     static int auxTime = 0;
+    size_t ventana = 5;
+    double factor_umbral = 2.0;
+    DetectorCambioBrusco detector(ventana, factor_umbral);
 
     // Load ONNX model
-    cv::dnn::Net net = cv::dnn::readNetFromONNX("models/model.onnx");
+    cv::dnn::Net net = cv::dnn::readNetFromONNX("models/model_fp16.onnx");
     net.setPreferableBackend(3);
     net.setPreferableTarget(1);
 
@@ -67,7 +71,7 @@ void imgExtractor(const std::string &fileName)
     bool contentText = false;
     bool temporalTextState = false;
     std::vector<std::future<std::string>> ocr_futures;
-    int counter = 1, temporalCounter = 1;
+    int counter = 1, temporalCounter = 1, temporalDifference = 0;
     while (counter <= total_frames)
     {
         cv::Mat img;
@@ -96,7 +100,7 @@ void imgExtractor(const std::string &fileName)
             cv::morphologyEx(outputFrame, outputFrame, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
             cv::erode(outputFrame, outputFrame, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)), cv::Point(-1, -1), 2);
             outputFrame.convertTo(outputFrame, CV_8U);
-
+            // cv::imshow("Output Frame", outputFrame);
             // Find contours
             std::vector<std::vector<cv::Point>> contours;
             cv::findContours(outputFrame, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
@@ -112,34 +116,36 @@ void imgExtractor(const std::string &fileName)
             for (const auto &contour : contours)
             {
                 cv::Rect rect = cv::boundingRect(contour);
-                if (rect.y > 112 && rect.height > 10)
-                {
+                // if (rect.y > 112 && rect.height > 10)
+                // {
                     double area = cv::contourArea(contour);
                     if (area > 112 && area < 112 * 224)
                     {
                         contentText = true;
 
                         // cv::Rect rect = cv::boundingRect(contour);
-                        cv::rectangle(frame, rect, cv::Scalar(0, 255, 0), 1);
+                        // cv::rectangle(frame, rect, cv::Scalar(0, 255, 0), 1);
                     }
-                }
+                // }
             }
 
             cv::Mat rest;
             cv::absdiff(outputFrame, temporalFrameGray, rest);
             cv::morphologyEx(rest, rest, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
             int difference = cv::sum(rest)[0];
-
-            // cv::imshow("entrada", frame);
-            // cv::imshow("test", outputFrame);
-            // cv::imshow("test2", rest);
-            int temporalTime = ((temporalCounter++ / fps) * 1000) - auxTime;
-            int temporalTimeC = ((counter / fps) * 1000) + auxTime;
-            if (difference > 30000 && temporalTextState && temporalTimeC - temporalTime > 300)
+            // std::cout << "Difference: " << difference << " time: "<<video.get(cv::CAP_PROP_POS_MSEC) << std::endl;
+            // std::cout << "Temporal Difference: " << 1000.0*(double)counter/fps << std::endl;
+            // cv::imshow("Difference", rest);
+            // cv::imshow("Frame", frame);
+            // cv::waitKey(500);
+            bool changeDetection=detector.detectar(difference, temporalDifference);
+            int temporalTime = (1000*(double)temporalCounter/ fps) - auxTime;
+            int temporalTimeC = (1000*(double)counter/ fps) + auxTime;
+            if (changeDetection && temporalTextState )
             {
 
                 // cout << "./" + folderName + "/" + format_milliseconds(temporalTime) + "__" + format_milliseconds(temporalTimeC) + ".jpeg" << endl;
-                std::string imagePath = "./" + folderName + "/" + format_milliseconds(((temporalCounter++ / fps) * 1000) - auxTime) + "__" + format_milliseconds(((counter / fps) * 1000) + auxTime) + ".jpeg";
+                std::string imagePath = "./" + folderName + "/" + format_milliseconds(temporalTime) + "__" + format_milliseconds(temporalTimeC) + ".jpeg";
                 cv::imwrite(imagePath, temporalFrameColor); // Espera a que haya un hilo disponible (semáforo)
                 sem_wait(&semaphore);
 
@@ -153,13 +159,12 @@ void imgExtractor(const std::string &fileName)
                 ocr_futures.push_back(std::move(ocrFuture));
             }
 
-            if (difference > 30000 && contentText)
+            if (changeDetection && contentText)
             {
                 temporalFrameColor = frameFull;
                 temporalCounter = counter;
             }
-
-            // cv::waitKey(1);
+            temporalDifference = difference;
             temporalFrameGray = outputFrame;
             temporalTextState = contentText;
         }
