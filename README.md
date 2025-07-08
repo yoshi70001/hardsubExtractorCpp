@@ -14,15 +14,13 @@ Una aplicación en C++11 para analizar archivos de video y extraer los fotograma
 
 - **Lenguaje:** C++11
 
-## Estructura del Directorio (Simplificada)
+## Estructura del Directorio
 
 ```
 .
 ├── build/              # Archivos de compilación y ejecutables
-├── output_images/      # Imágenes extraídas de los videos
-├── utils/              # Módulos de utilidad (detección de texto, etc.)
 ├── videos/             # Directorio para colocar los videos de entrada
-├── main.cpp            # Punto de entrada principal de la aplicación
+├── main.cpp            # Punto de entrada principal de la aplicación C++
 └── README.md           # Este archivo
 ```
 
