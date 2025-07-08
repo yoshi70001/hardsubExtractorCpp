@@ -63,9 +63,9 @@ void imgExtractor(const std::string &fileName)
     DetectorCambioBrusco detector(ventana, factor_umbral);
 
     // Load ONNX model
-    cv::dnn::Net net = cv::dnn::readNetFromONNX("models/model_fp16.onnx");
-    net.setPreferableBackend(3);
-    net.setPreferableTarget(1);
+    cv::dnn::Net net = cv::dnn::readNetFromONNX("models/model.onnx");
+    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+    net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
 
     cv::Mat temporalFrameGray, temporalFrameColor;
     bool contentText = false;
@@ -96,11 +96,11 @@ void imgExtractor(const std::string &fileName)
 
             // Process output
             cv::Mat outputFrame = detections[0].reshape(1, {224, 224}) * 255;
-            cv::threshold(outputFrame, outputFrame, 30, 255, cv::THRESH_BINARY);
+            cv::threshold(outputFrame, outputFrame, 127, 255, cv::THRESH_BINARY);
             cv::morphologyEx(outputFrame, outputFrame, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
             cv::erode(outputFrame, outputFrame, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)), cv::Point(-1, -1), 2);
             outputFrame.convertTo(outputFrame, CV_8U);
-            // cv::imshow("Output Frame", outputFrame);
+            cv::imshow("Output Frame", outputFrame);
             // Find contours
             std::vector<std::vector<cv::Point>> contours;
             cv::findContours(outputFrame, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
@@ -118,14 +118,14 @@ void imgExtractor(const std::string &fileName)
                 cv::Rect rect = cv::boundingRect(contour);
                 // if (rect.y > 112 && rect.height > 10)
                 // {
-                    double area = cv::contourArea(contour);
-                    if (area > 112 && area < 112 * 224)
-                    {
-                        contentText = true;
+                double area = cv::contourArea(contour);
+                if (area > 240 && area < 22580)
+                {
+                    contentText = true;
 
-                        // cv::Rect rect = cv::boundingRect(contour);
-                        // cv::rectangle(frame, rect, cv::Scalar(0, 255, 0), 1);
-                    }
+                    // cv::Rect rect = cv::boundingRect(contour);
+                    // cv::rectangle(frame, rect, cv::Scalar(0, 255, 0), 1);
+                }
                 // }
             }
 
@@ -138,10 +138,10 @@ void imgExtractor(const std::string &fileName)
             // cv::imshow("Difference", rest);
             // cv::imshow("Frame", frame);
             // cv::waitKey(500);
-            bool changeDetection=detector.detectar(difference, temporalDifference);
-            int temporalTime = (1000*(double)temporalCounter/ fps) - auxTime;
-            int temporalTimeC = (1000*(double)counter/ fps) + auxTime;
-            if (changeDetection && temporalTextState )
+            bool changeDetection = detector.detectar(difference, temporalDifference);
+            int temporalTime = (1000 * (double)temporalCounter / fps) - auxTime;
+            int temporalTimeC = (1000 * (double)counter / fps) + auxTime;
+            if (changeDetection && temporalTextState)
             {
 
                 // cout << "./" + folderName + "/" + format_milliseconds(temporalTime) + "__" + format_milliseconds(temporalTimeC) + ".jpeg" << endl;
