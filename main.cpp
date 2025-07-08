@@ -26,7 +26,6 @@ const double AREA_THRESHOLD_MIN = 240.0;
 const double AREA_THRESHOLD_MAX = 22580.0;
 const cv::String MODEL_PATH = "models/model.onnx";
 const std::string VIDEOS_DIR = "videos";
-const std::string OUTPUT_DIR = "output_images";
 
 // #############################################################################
 // ### NUEVAS CONSTANTES PARA MEJORAR LA DETECCIÓN DE CAMBIO DE SUBTÍTULO ###
@@ -82,8 +81,9 @@ void imgExtractor(const std::string &fileName, cv::dnn::Net &net) {
         cerr << "Error al abrir el video: " << videoPath << endl;
         return;
     }
+    
+    string folderName = createFolderByFileName("RGBImages"); 
 
-    string folderName = createFolderByFileName(fileName); 
     double fps = video.get(CAP_PROP_FPS);
     int total_frames = static_cast<int>(video.get(CAP_PROP_FRAME_COUNT));
     cout << "Procesando: " << fileName << " (FPS: " << fps << ", Frames: " << total_frames << ")" << endl;
@@ -194,7 +194,6 @@ int main() {
     // El código de main no cambia
     struct stat st;
     if (stat(VIDEOS_DIR.c_str(), &st) == -1) { mkdir(VIDEOS_DIR.c_str()); }
-    if (stat(OUTPUT_DIR.c_str(), &st) == -1) { mkdir(OUTPUT_DIR.c_str()); }
     
     cout << "Cargando modelo DNN desde " << MODEL_PATH << "..." << endl;
     cv::dnn::Net net;
