@@ -3,3 +3,4 @@ videos
 subtitles
 .vscode
 *.exe
+*.json
