@@ -1,205 +1,217 @@
-#include <opencv2/opencv.hpp>
-#include <opencv2/dnn.hpp>
-#include <string>
 #include <iostream>
-#include <dirent.h>
-#include <sys/types.h>
-#include <cstring>
+#include <string>
 #include <vector>
-#include <sys/stat.h>
-#include "fileManager.h"
-#include "utils/ocr.hpp"
-#include <cstdio>
-#include <future>
-#include <fstream>
-#include <semaphore.h> // Para semáforos
 #include <chrono>
-#include <thread>
-#include "utils/media.hpp"
-const int MAX_CONCURRENT_THREADS = 2;
-sem_t semaphore;
+#include <fstream>
+#include <sstream>
+#include <iomanip>
 
-std::string performOCR(const std::string &imagePath)
-{
-    // std::cout << "Realizando OCR en: " << imagePath << std::endl;
-    // std::string text = "Texto OCR de " + imagePath; // Placeholder
-    // std::this_thread::sleep_for(std::chrono::seconds(1));
-    // return getTextByImage(imagePath);
-    return "test";
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <dirent.h>
+
+#include <opencv2/core.hpp>
+#include <opencv2/videoio.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/dnn.hpp>
+#include <opencv2/highgui.hpp>
+
+#include "fileManager.h"
+
+// --- Constantes de configuración ---
+const int DNN_INPUT_SIZE = 224;
+const double DNN_SCALE_FACTOR = 1.0 / 255.0;
+const int FRAME_SKIP_RATE = 2; 
+const double AREA_THRESHOLD_MIN = 240.0;
+const double AREA_THRESHOLD_MAX = 22580.0;
+const cv::String MODEL_PATH = "models/model.onnx";
+const std::string VIDEOS_DIR = "videos";
+const std::string OUTPUT_DIR = "output_images";
+
+// #############################################################################
+// ### NUEVAS CONSTANTES PARA MEJORAR LA DETECCIÓN DE CAMBIO DE SUBTÍTULO ###
+// #############################################################################
+const int TEXT_ABSENCE_PERSISTENCE_THRESHOLD = 3; 
+
+// Umbral de píxeles cambiados en la máscara de 224x224 para considerar un nuevo subtítulo.
+// Un valor entre 300-800 suele funcionar bien. Un valor más bajo es más sensible.
+// Total de píxeles es 224*224 = 50,176. 500 píxeles es ~1% de cambio.
+const int TEXT_CHANGE_PIXEL_THRESHOLD = 500;
+// #############################################################################
+
+// (Las funciones auxiliares get_filename_from_path y format_milliseconds no cambian)
+std::string get_filename_from_path(const std::string& path) {
+    size_t last_slash_pos = path.find_last_of("/\\");
+    if (std::string::npos != last_slash_pos) {
+        return path.substr(last_slash_pos + 1);
+    }
+    return path;
 }
 
-std::string format_milliseconds(int ms)
-{
-    int horas = ms / 3600000;
+std::string format_milliseconds(int ms) {
+    int hours = ms / 3600000;
     ms %= 3600000;
-    int minutos = ms / 60000;
+    int minutes = ms / 60000;
     ms %= 60000;
-    int segundos = ms / 1000;
-    int milisegundos = ms % 1000;
-    char buffer[20];
-    std::sprintf(buffer, "%02d_%02d_%02d_%03d", horas, minutos, segundos, milisegundos);
-    return std::string(buffer);
+    int seconds = ms / 1000;
+    int milliseconds = ms % 1000;
+
+    std::ostringstream oss;
+    oss << std::setfill('0') << std::setw(2) << hours << "_"
+        << std::setfill('0') << std::setw(2) << minutes << "_"
+        << std::setfill('0') << std::setw(2) << seconds << "_"
+        << std::setfill('0') << std::setw(3) << milliseconds;
+    return oss.str();
 }
 
-void imgExtractor(const std::string &fileName)
-{
-    string pathVideo = "videos/" + fileName;
-    cv::VideoCapture video(pathVideo, cv::VideoCaptureAPIs::CAP_FFMPEG);
-    if (!video.isOpened())
-    {
-        std::cerr << "Error opening video file\n";
+
+/**
+ * @brief Extrae y guarda un único frame por cada bloque o cambio significativo de texto.
+ * @param fileName Nombre del archivo de video.
+ * @param net Red neuronal pre-cargada.
+ */
+void imgExtractor(const std::string &fileName, cv::dnn::Net &net) {
+    using namespace std;
+    using namespace cv;
+
+    enum TextDetectionState { SEARCHING_FOR_TEXT, TEXT_IN_PROGRESS };
+
+    string videoPath = VIDEOS_DIR + "/" + fileName;
+    VideoCapture video(videoPath, VideoCaptureAPIs::CAP_FFMPEG);
+    if (!video.isOpened()) {
+        cerr << "Error al abrir el video: " << videoPath << endl;
         return;
     }
 
-    string folderName = createFolderByFileName(fileName);
+    string folderName = createFolderByFileName(fileName); 
+    double fps = video.get(CAP_PROP_FPS);
+    int total_frames = static_cast<int>(video.get(CAP_PROP_FRAME_COUNT));
+    cout << "Procesando: " << fileName << " (FPS: " << fps << ", Frames: " << total_frames << ")" << endl;
+    
+    // --- Variables de la máquina de estados ---
+    TextDetectionState currentState = SEARCHING_FOR_TEXT;
+    Mat textSceneFrame;
+    Mat textSceneStartMask; // Máscara del inicio de la escena
+    long long textSceneStartTimeMs = 0;
+    int framesWithoutTextCounter = 0;
+    long long lastProcessedFrameTimeMs = 0;
 
-    static double fps = video.get(cv::CAP_PROP_FPS);
-    int total_frames = static_cast<int>(video.get(cv::CAP_PROP_FRAME_COUNT));
-    std::cout << "FPS: " << fps << ", Total Frames: " << total_frames << std::endl;
-    static int fpsCut = static_cast<int>(2);
-    static int auxTime = 0;
-    size_t ventana = 5;
-    double factor_umbral = 2.0;
-    DetectorCambioBrusco detector(ventana, factor_umbral);
-
-    // Load ONNX model
-    cv::dnn::Net net = cv::dnn::readNetFromONNX("models/model.onnx");
-    net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
-
-    cv::Mat temporalFrameGray, temporalFrameColor;
-    bool contentText = false;
-    bool temporalTextState = false;
-    std::vector<std::future<std::string>> ocr_futures;
-    int counter = 1, temporalCounter = 1, temporalDifference = 0;
-    while (counter <= total_frames)
-    {
-        cv::Mat img;
+    for (int counter = 1; counter <= total_frames; ++counter) {
+        Mat img;
         video >> img;
-        if (img.empty())
-            break;
+        if (img.empty()) break;
 
-        if (counter % fpsCut == 0)
-        {
-            cv::Mat frameFull = img.clone();
-            contentText = false;
-            cv::resize(img, img, cv::Size(224, 224), cv::INTER_AREA);
-            cv::Mat frame = img.clone();
-            cv::Mat frameAux = img.clone();
-            // img.convertTo(img, CV_32F, 1.0 / 255);
-            cv::Mat blob = cv::dnn::blobFromImage(img, 1.0 / 255);
-            blob = blob.reshape(1, {1, 3, 224, 224});
-            // Set input and run forward pass
+        if (counter % FRAME_SKIP_RATE == 0) {
+            bool hasText = false;
+            
+            Mat resizedImg;
+            resize(img, resizedImg, Size(DNN_INPUT_SIZE, DNN_INPUT_SIZE), INTER_AREA);
+            Mat blob = dnn::blobFromImage(resizedImg, DNN_SCALE_FACTOR, Size(DNN_INPUT_SIZE, DNN_INPUT_SIZE), Scalar(), true, false);
             net.setInput(blob);
-            std::vector<cv::Mat> detections;
+            vector<Mat> detections;
             net.forward(detections);
 
-            // Process output
-            cv::Mat outputFrame = detections[0].reshape(1, {224, 224}) * 255;
-            cv::threshold(outputFrame, outputFrame, 127, 255, cv::THRESH_BINARY);
-            cv::morphologyEx(outputFrame, outputFrame, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
-            cv::erode(outputFrame, outputFrame, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)), cv::Point(-1, -1), 2);
-            outputFrame.convertTo(outputFrame, CV_8U);
-            cv::imshow("Output Frame", outputFrame);
-            // Find contours
-            std::vector<std::vector<cv::Point>> contours;
-            cv::findContours(outputFrame, contours, cv::RETR_TREE, cv::CHAIN_APPROX_SIMPLE);
-
-            if (counter == fpsCut)
-            {
-                temporalTextState = false;
-                temporalFrameGray = outputFrame;
-                temporalFrameColor = frameFull;
-            }
-
-            // std::vector<std::vector<int>> areas;
-            for (const auto &contour : contours)
-            {
-                cv::Rect rect = cv::boundingRect(contour);
-                // if (rect.y > 112 && rect.height > 10)
-                // {
-                double area = cv::contourArea(contour);
-                if (area > 240 && area < 22580)
-                {
-                    contentText = true;
-
-                    // cv::Rect rect = cv::boundingRect(contour);
-                    // cv::rectangle(frame, rect, cv::Scalar(0, 255, 0), 1);
+            Mat currentMask = detections[0].reshape(1, DNN_INPUT_SIZE) * 255;
+            threshold(currentMask, currentMask, 127, 255, THRESH_BINARY);
+            currentMask.convertTo(currentMask, CV_8U);
+            
+            vector<vector<Point> > contours;
+            findContours(currentMask, contours, RETR_TREE, CHAIN_APPROX_SIMPLE);
+            for (size_t i = 0; i < contours.size(); ++i) {
+                if (contourArea(contours[i]) > AREA_THRESHOLD_MIN && contourArea(contours[i]) < AREA_THRESHOLD_MAX) {
+                    hasText = true;
+                    break;
                 }
-                // }
             }
+            
+            long long currentFrameTimeMs = static_cast<long long>(video.get(CAP_PROP_POS_MSEC));
 
-            cv::Mat rest;
-            cv::absdiff(outputFrame, temporalFrameGray, rest);
-            cv::morphologyEx(rest, rest, cv::MORPH_OPEN, cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3)));
-            int difference = cv::sum(rest)[0];
-            // std::cout << "Difference: " << difference << " time: "<<video.get(cv::CAP_PROP_POS_MSEC) << std::endl;
-            // std::cout << "Temporal Difference: " << 1000.0*(double)counter/fps << std::endl;
-            // cv::imshow("Difference", rest);
-            // cv::imshow("Frame", frame);
-            // cv::waitKey(500);
-            bool changeDetection = detector.detectar(difference, temporalDifference);
-            int temporalTime = (1000 * (double)temporalCounter / fps) - auxTime;
-            int temporalTimeC = (1000 * (double)counter / fps) + auxTime;
-            if (changeDetection && temporalTextState)
-            {
+            // --- Lógica de la máquina de estados ---
+            if (currentState == SEARCHING_FOR_TEXT) {
+                if (hasText) {
+                    cout << "EVENTO: Inicio de texto en " << format_milliseconds(currentFrameTimeMs) << endl;
+                    textSceneFrame = img.clone();
+                    textSceneStartTimeMs = currentFrameTimeMs;
+                    textSceneStartMask = currentMask.clone(); // Guardamos la máscara inicial
+                    currentState = TEXT_IN_PROGRESS;
+                    framesWithoutTextCounter = 0;
+                }
+            } else { // currentState == TEXT_IN_PROGRESS
+                if (hasText) {
+                    // --- Comparamos la máscara actual con la del inicio de la escena ---
+                    Mat diff;
+                    absdiff(currentMask, textSceneStartMask, diff);
+                    int changedPixels = countNonZero(diff);
 
-                // cout << "./" + folderName + "/" + format_milliseconds(temporalTime) + "__" + format_milliseconds(temporalTimeC) + ".jpeg" << endl;
-                std::string imagePath = "./" + folderName + "/" + format_milliseconds(temporalTime) + "__" + format_milliseconds(temporalTimeC) + ".jpeg";
-                cv::imwrite(imagePath, temporalFrameColor); // Espera a que haya un hilo disponible (semáforo)
-                sem_wait(&semaphore);
-
-                // Lanza el OCR de forma asíncrona
-                std::future<std::string> ocrFuture = std::async(std::launch::async, [imagePath]()
-                                                                {
-                 std::string result = performOCR(imagePath);
-                 sem_post(&semaphore); // Libera un hilo (semáforo)
-                 return result; });
-
-                ocr_futures.push_back(std::move(ocrFuture));
+                    if (changedPixels > TEXT_CHANGE_PIXEL_THRESHOLD) {
+                        cout << "EVENTO: Cambio significativo de texto detectado (" << changedPixels << " pixeles)." << endl;
+                        // Guardamos la escena ANTERIOR
+                        string imagePath = folderName + "/" + format_milliseconds(textSceneStartTimeMs) + "__" + format_milliseconds(lastProcessedFrameTimeMs) + ".jpeg";
+                        if (imwrite(imagePath, textSceneFrame)) {
+                             cout << "  > Imagen de escena anterior guardada: " << get_filename_from_path(imagePath) << endl;
+                        }
+                        
+                        // Y empezamos una NUEVA escena con los datos actuales
+                        cout << "  > Iniciando nueva escena de texto en " << format_milliseconds(currentFrameTimeMs) << endl;
+                        textSceneFrame = img.clone();
+                        textSceneStartTimeMs = currentFrameTimeMs;
+                        textSceneStartMask = currentMask.clone();
+                    }
+                    
+                    framesWithoutTextCounter = 0; // Reiniciamos contador de ausencia
+                } else {
+                    // El texto ha desaparecido, empezamos a contar para confirmar
+                    framesWithoutTextCounter++;
+                    if (framesWithoutTextCounter >= TEXT_ABSENCE_PERSISTENCE_THRESHOLD) {
+                        cout << "EVENTO: Fin de texto confirmado." << endl;
+                        string imagePath = folderName + "/" + format_milliseconds(textSceneStartTimeMs) + "__" + format_milliseconds(currentFrameTimeMs) + ".jpeg";
+                        if (imwrite(imagePath, textSceneFrame)) {
+                            cout << "  > Imagen guardada: " << get_filename_from_path(imagePath) << endl;
+                        }
+                        
+                        currentState = SEARCHING_FOR_TEXT;
+                    }
+                }
             }
-
-            if (changeDetection && contentText)
-            {
-                temporalFrameColor = frameFull;
-                temporalCounter = counter;
-            }
-            temporalDifference = difference;
-            temporalFrameGray = outputFrame;
-            temporalTextState = contentText;
+            lastProcessedFrameTimeMs = currentFrameTimeMs;
         }
-
-        counter++;
     }
+    
+    if (currentState == TEXT_IN_PROGRESS) {
+        cout << "EVENTO: Video terminó durante un bloque de texto. Guardando última escena." << endl;
+        string imagePath = folderName + "/" + format_milliseconds(textSceneStartTimeMs) + "__" + format_milliseconds(lastProcessedFrameTimeMs) + ".jpeg";
+        imwrite(imagePath, textSceneFrame);
+        cout << "  > Imagen guardada: " << get_filename_from_path(imagePath) << endl;
+    }
+
     video.release();
-    cv::destroyAllWindows();
-    // Espera a que todas las tareas de OCR se completen y guarda los resultados
-    for (auto &future : ocr_futures)
-    {
-        std::string ocrText = future.get();
-        // std::string imagePath = future.get(); // NO FUNCIONA, el "future" ya se obtuvo.
-
-        // std::string txtPath = imagePath.substr(0, imagePath.size() - 4) + ".txt"; // Reemplaza la extensión .jpeg por .txt
-        // std::ofstream outfile(txtPath);
-        // outfile << ocrText << std::endl;
-        // outfile.close();
-
-        // std::cout << "Texto OCR: " << ocrText << " guardado en " << txtPath << std::endl;
-    }
+    destroyAllWindows();
+    cout << "Extracción completada para el video: " << fileName << endl;
 }
-int main()
-{
-    sem_init(&semaphore, 0, MAX_CONCURRENT_THREADS);
-    if (existeDirectorio("videos") == false)
-    {
-        mkdir("videos");
-    }
-    if (existeDirectorio("subtitles") == false)
-    {
-        mkdir("subtitles");
-    }
-    list_files("videos", imgExtractor);
-    sem_destroy(&semaphore); // Destruye el semáforo
 
+
+int main() {
+    // El código de main no cambia
+    struct stat st;
+    if (stat(VIDEOS_DIR.c_str(), &st) == -1) { mkdir(VIDEOS_DIR.c_str()); }
+    if (stat(OUTPUT_DIR.c_str(), &st) == -1) { mkdir(OUTPUT_DIR.c_str()); }
+    
+    cout << "Cargando modelo DNN desde " << MODEL_PATH << "..." << endl;
+    cv::dnn::Net net;
+    try {
+        net = cv::dnn::readNetFromONNX(MODEL_PATH);
+        net.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+        net.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL);
+    } catch (const cv::Exception& e) {
+        cerr << "Error al cargar el modelo DNN: " << e.what() << endl;
+        return 1;
+    }
+    cout << "Modelo cargado exitosamente." << endl;
+
+    list_files(VIDEOS_DIR, [&](const std::string& fileName) {
+        imgExtractor(fileName, net);
+    });
+    
+    cout << "Proceso completado." << endl;
     return 0;
 }
